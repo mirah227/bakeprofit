@@ -1,0 +1,6 @@
+{
+  "name": "BakeProfit",
+  "description": "Know your costs. Price with confidence. A modern bakery costing and profit calculator for home bakers, cake vendors, and small baking businesses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
