@@ -34,13 +34,98 @@ export interface PaymentTransactionRecord {
 export interface UserPremiumRecord {
   userId: string;
   isPremium: boolean;
+  hasOneTimePurchase: boolean;
+  hasMonthlySubscription: boolean;
   plan?: PremiumPlanId | null;
   transactionReference?: string | null;
+  oneTimeTransactionReference?: string | null;
+  monthlyTransactionReference?: string | null;
   amountPaid?: number | null;
   currency?: 'NGN';
   environment?: NovacEnvironment | null;
   status?: TransactionStatus | null;
   unlockedAt?: string | null;
+}
+
+export function resolvePlanEntitlements(params: {
+  userId: string;
+  subRow: SubscriptionRow | null;
+  verifiedTransactions: PaymentTransactionRecord[];
+}): UserPremiumRecord {
+  const { userId, subRow, verifiedTransactions } = params;
+
+  const verifiedOneTimeTx = verifiedTransactions.find(
+    (tx) =>
+      tx.status === 'successful' &&
+      tx.plan === 'onetime' &&
+      Number(tx.expectedAmount) >= 1000
+  );
+  const verifiedMonthlyTx = verifiedTransactions.find(
+    (tx) =>
+      tx.status === 'successful' &&
+      tx.plan === 'monthly' &&
+      Number(tx.expectedAmount) >= 2000
+  );
+
+  const subIsActive = Boolean(subRow?.is_premium) && subRow?.status === 'successful';
+  const subAmount =
+    subRow?.amount_paid !== null && subRow?.amount_paid !== undefined
+      ? Number(subRow.amount_paid)
+      : null;
+
+  const hasOneTimePurchase = Boolean(
+    verifiedOneTimeTx ||
+      (subIsActive && subRow?.plan === 'onetime' && (subAmount === null || subAmount >= 1000))
+  );
+
+  const hasMonthlySubscription = Boolean(
+    verifiedMonthlyTx ||
+      (subIsActive && subRow?.plan === 'monthly' && subAmount !== null && subAmount >= 2000)
+  );
+
+  const isPremium = hasOneTimePurchase || hasMonthlySubscription || subIsActive;
+  const primaryVerifiedTx = verifiedMonthlyTx || verifiedOneTimeTx || null;
+
+  if (subRow && isPremium) {
+    return {
+      userId,
+      isPremium,
+      hasOneTimePurchase,
+      hasMonthlySubscription,
+      plan: subRow.plan ?? primaryVerifiedTx?.plan ?? null,
+      transactionReference:
+        subRow.transaction_reference ?? primaryVerifiedTx?.transactionReference ?? null,
+      oneTimeTransactionReference:
+        verifiedOneTimeTx?.transactionReference ??
+        (subRow.plan === 'onetime' ? subRow.transaction_reference : null),
+      monthlyTransactionReference:
+        verifiedMonthlyTx?.transactionReference ??
+        (subRow.plan === 'monthly' ? subRow.transaction_reference : null),
+      amountPaid:
+        subAmount ?? (primaryVerifiedTx ? Number(primaryVerifiedTx.expectedAmount) : null),
+      currency: subRow.currency || 'NGN',
+      environment: subRow.environment ?? primaryVerifiedTx?.environment ?? null,
+      status: subRow.status ?? primaryVerifiedTx?.status ?? null,
+      unlockedAt: subRow.unlocked_at ?? primaryVerifiedTx?.verifiedAt ?? null,
+    };
+  }
+
+  return {
+    userId,
+    isPremium,
+    hasOneTimePurchase,
+    hasMonthlySubscription,
+    plan: primaryVerifiedTx?.plan ?? subRow?.plan ?? null,
+    transactionReference:
+      primaryVerifiedTx?.transactionReference ?? subRow?.transaction_reference ?? null,
+    oneTimeTransactionReference: verifiedOneTimeTx?.transactionReference ?? null,
+    monthlyTransactionReference: verifiedMonthlyTx?.transactionReference ?? null,
+    amountPaid: primaryVerifiedTx ? Number(primaryVerifiedTx.expectedAmount) : subAmount,
+    currency: primaryVerifiedTx?.currency ?? subRow?.currency ?? 'NGN',
+    environment: primaryVerifiedTx?.environment ?? subRow?.environment ?? null,
+    status: primaryVerifiedTx?.status ?? subRow?.status ?? null,
+    unlockedAt: primaryVerifiedTx?.verifiedAt ?? subRow?.unlocked_at ?? null,
+  };
 }
 
 interface TransactionRow {
@@ -336,13 +421,41 @@ export async function updateTransactionAndSubscription(params: {
       .maybeSingle<{ transaction_reference: string | null }>();
 
     if (currentSub?.transaction_reference === params.transactionReference) {
-      await admin
-        .from('premium_subscriptions')
-        .update({
-          is_premium: false,
-          status: 'reversed',
-        })
-        .eq('user_id', params.userId);
+      // Preserve access if the user has another verified successful transaction (e.g. an earlier One-Time Pass)
+      const { data: fallbackRows } = await admin
+        .from('payment_transactions')
+        .select('*')
+        .eq('user_id', params.userId)
+        .eq('status', 'successful')
+        .neq('transaction_reference', params.transactionReference)
+        .order('verified_at', { ascending: false, nullsFirst: false })
+        .limit(1)
+        .returns<TransactionRow[]>();
+
+      const fallback = fallbackRows?.[0];
+      if (fallback) {
+        await admin
+          .from('premium_subscriptions')
+          .update({
+            is_premium: true,
+            plan: fallback.plan,
+            transaction_reference: fallback.transaction_reference,
+            amount_paid: fallback.expected_amount,
+            currency: fallback.currency || 'NGN',
+            environment: fallback.environment,
+            status: 'successful',
+            unlocked_at: fallback.verified_at || fallback.created_at,
+          })
+          .eq('user_id', params.userId);
+      } else {
+        await admin
+          .from('premium_subscriptions')
+          .update({
+            is_premium: false,
+            status: 'reversed',
+          })
+          .eq('user_id', params.userId);
+      }
     }
   }
 
@@ -408,20 +521,38 @@ export async function getUserPremiumState(userId: string): Promise<{
         .order('created_at', { ascending: false })
         .limit(10)
         .returns<TransactionRow[]>(),
+      admin
+        .from('payment_transactions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('status', 'successful')
+        .order('verified_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .returns<TransactionRow[]>(),
     ]);
 
-  let [{ data: subRow, error: subErr }, { data: txRows, error: txErr }] =
-    await queryUserState();
+  let [
+    { data: subRow, error: subErr },
+    { data: txRows, error: txErr },
+    { data: verifiedRows, error: verifiedErr },
+  ] = await queryUserState();
 
   // Retry with backoff in case PostgREST is mid schema-cache reload
   const retryDelaysMs = [250, 500, 1000];
   for (const delayMs of retryDelaysMs) {
-    if (!isSchemaMissingError(subErr) && !isSchemaMissingError(txErr)) {
+    if (
+      !isSchemaMissingError(subErr) &&
+      !isSchemaMissingError(txErr) &&
+      !isSchemaMissingError(verifiedErr)
+    ) {
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, delayMs));
-    [{ data: subRow, error: subErr }, { data: txRows, error: txErr }] =
-      await queryUserState();
+    [
+      { data: subRow, error: subErr },
+      { data: txRows, error: txErr },
+      { data: verifiedRows, error: verifiedErr },
+    ] = await queryUserState();
   }
 
   if (subErr) {
@@ -432,31 +563,22 @@ export async function getUserPremiumState(userId: string): Promise<{
     }
     throw new Error(`Failed to fetch premium subscription: ${subErr.message}`);
   }
-  if (txErr) {
-    if (isSchemaMissingError(txErr)) {
+  if (txErr || verifiedErr) {
+    const err = txErr || verifiedErr;
+    if (isSchemaMissingError(err)) {
       throw new SupabaseSchemaNotReadyError(
-        `Supabase table public.payment_transactions is unavailable in schema cache (${txErr.message}). Run migrations 001 and 002 in Supabase SQL Editor.`
+        `Supabase table public.payment_transactions is unavailable in schema cache (${err!.message}). Run migrations 001 and 002 in Supabase SQL Editor.`
       );
     }
-    throw new Error(`Failed to fetch payment transactions: ${txErr.message}`);
+    throw new Error(`Failed to fetch payment transactions: ${err!.message}`);
   }
 
-  const account: UserPremiumRecord = subRow
-    ? {
-        userId,
-        isPremium: Boolean(subRow.is_premium),
-        plan: subRow.plan,
-        transactionReference: subRow.transaction_reference,
-        amountPaid: subRow.amount_paid !== null ? Number(subRow.amount_paid) : null,
-        currency: subRow.currency || 'NGN',
-        environment: subRow.environment,
-        status: subRow.status,
-        unlockedAt: subRow.unlocked_at,
-      }
-    : {
-        userId,
-        isPremium: false,
-      };
+  const verifiedTransactions = (verifiedRows ?? []).map(mapTransactionRow);
+  const account = resolvePlanEntitlements({
+    userId,
+    subRow: subRow ?? null,
+    verifiedTransactions,
+  });
 
   return {
     account,

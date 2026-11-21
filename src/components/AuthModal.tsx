@@ -1,6 +1,6 @@
 import { AlertCircle, CheckCircle2, Loader2, X } from 'lucide-react';
 import { FormEvent, useState } from 'react';
-import { initSupabaseClient } from '../lib/supabase';
+import { getAuthRedirectUrl, initSupabaseClient } from '../lib/supabase';
 
 interface AuthModalProps {
   initialMode?: 'login' | 'signup';
@@ -55,10 +55,12 @@ export function AuthModal({
           return;
         }
 
+        const emailRedirectTo = getAuthRedirectUrl();
         const { data, error: signUpError } = await supabase.auth.signUp({
           email: cleanEmail,
           password,
           options: {
+            ...(emailRedirectTo ? { emailRedirectTo } : {}),
             data: {
               full_name: fullName.trim(),
               business_name: businessName.trim() || null,
@@ -76,7 +78,7 @@ export function AuthModal({
           onClose();
         } else {
           setConfirmationMessage(
-            'Account created! Please check your email inbox to confirm your email address, then log in.'
+            'Account created! Check your email inbox and tap the confirmation link, then return here and log in. (If your email app shows 403 when opening the private Google AI Studio preview link directly, your email is still confirmed — simply return to this tab and log in.)'
           );
         }
       } else {

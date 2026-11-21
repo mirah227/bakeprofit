@@ -85,6 +85,14 @@ export function PremiumView({
   } | null>(null);
 
   const isPremium = Boolean(premiumStatus?.isPremium);
+  const hasOneTimePurchase = Boolean(
+    premiumStatus?.hasOneTimePurchase ??
+      (isPremium && premiumStatus?.plan !== 'monthly')
+  );
+  const hasMonthlySubscription = Boolean(
+    premiumStatus?.hasMonthlySubscription ??
+      (isPremium && premiumStatus?.plan === 'monthly')
+  );
   const mode = paymentConfig?.mode ?? premiumStatus?.mode ?? 'test';
 
   const openUpgradeModal = (plan: PremiumPlanId) => {
@@ -334,9 +342,11 @@ export function PremiumView({
                   <span>
                     Plan:{' '}
                     <strong>
-                      {premiumStatus.plan === 'monthly'
-                        ? 'Monthly Subscription'
-                        : 'One-Time Upgrade'}
+                      {hasOneTimePurchase && hasMonthlySubscription
+                        ? 'One-Time Pass & Monthly Subscription'
+                        : hasMonthlySubscription
+                          ? 'Monthly Subscription'
+                          : 'One-Time Upgrade'}
                     </strong>
                   </span>
                   <span aria-hidden="true">·</span>
@@ -452,12 +462,12 @@ export function PremiumView({
 
           <button
             type="button"
-            disabled={isPremium}
+            disabled={hasOneTimePurchase}
             onClick={() => openUpgradeModal('onetime')}
             className="mt-8 w-full inline-flex items-center justify-center gap-2 py-3 px-4 text-sm font-semibold text-white bg-[#4A352E] hover:bg-[#3B2A24] disabled:bg-[#2E6B4E] disabled:opacity-90 rounded-xl transition-colors cursor-pointer disabled:cursor-default"
           >
             <Sparkles className="w-4 h-4" />
-            {isPremium ? 'Premium Unlocked' : 'Upgrade to Premium'}
+            {hasOneTimePurchase ? 'One-Time Pass Unlocked' : 'Upgrade to Premium'}
           </button>
         </section>
 
@@ -491,13 +501,17 @@ export function PremiumView({
           <div className="mt-8">
             <button
               type="button"
-              disabled={isPremium}
+              disabled={hasMonthlySubscription}
               onClick={() => openUpgradeModal('monthly')}
-              className="w-full inline-flex items-center justify-center gap-2 py-3 px-4 text-sm font-semibold text-[#4A352E] bg-[#FCF9F6] border border-[#DECFC6] hover:border-[#A45567] hover:bg-[#FBF0F2] disabled:opacity-60 rounded-xl transition-colors cursor-pointer disabled:cursor-default"
+              className={`w-full inline-flex items-center justify-center gap-2 py-3 px-4 text-sm font-semibold rounded-xl transition-colors cursor-pointer disabled:cursor-default ${
+                hasMonthlySubscription
+                  ? 'text-white bg-[#2E6B4E] opacity-90'
+                  : 'text-[#4A352E] bg-[#FCF9F6] border border-[#DECFC6] hover:border-[#A45567] hover:bg-[#FBF0F2]'
+              }`}
             >
-              {isPremium ? 'Premium Unlocked' : 'Subscribe Monthly'}
+              {hasMonthlySubscription ? 'Monthly Subscription Active' : 'Subscribe Monthly'}
             </button>
-            {paymentConfig && !paymentConfig.monthlyConfigured && !isPremium && (
+            {paymentConfig && !paymentConfig.monthlyConfigured && !hasMonthlySubscription && (
               <p className="mt-2 text-[11px] text-[#8D7369] text-center">
                 Requires Novac recurring payment link ref (NOVAC_TEST_MONTHLY_PAYMENT_LINK_REF).
               </p>

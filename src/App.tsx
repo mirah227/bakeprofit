@@ -15,8 +15,10 @@ import { PricingView } from './components/PricingView';
 import { RecipesView } from './components/RecipesView';
 import { createBlankRecipe, createStarterRecipe } from './data/presets';
 import {
+  completeAuthCallbackFromUrl,
   fetchSupabaseHealth,
   initSupabaseClient,
+  type AuthCallbackResult,
   type SupabaseHealthStatus,
 } from './lib/supabase';
 import {
@@ -63,6 +65,9 @@ export default function App() {
   const [premiumStatus, setPremiumStatus] = useState<PremiumStatusResponse | null>(null);
   const [supabaseHealth, setSupabaseHealth] = useState<SupabaseHealthStatus | null>(null);
   const [paymentNotification, setPaymentNotification] = useState<PaymentNotification | null>(
+    null
+  );
+  const [authCallbackBanner, setAuthCallbackBanner] = useState<AuthCallbackResult | null>(
     null
   );
 
@@ -124,6 +129,11 @@ export default function App() {
       if (!active) return;
 
       if (supabase) {
+        const callbackResult = await completeAuthCallbackFromUrl(supabase);
+        if (active && callbackResult.status !== 'none') {
+          setAuthCallbackBanner(callbackResult);
+        }
+
         const { data } = await supabase.auth.getSession();
         const sessionUser = data.session?.user ?? null;
         if (active) {
@@ -330,6 +340,26 @@ export default function App() {
             supabase/migrations/001_bakeprofit_schema.sql
           </span>{' '}
           in your Supabase SQL Editor to create tables ({supabaseHealth.missingTables.join(', ')}).
+        </div>
+      )}
+
+      {authCallbackBanner && authCallbackBanner.status !== 'none' && authCallbackBanner.message && (
+        <div
+          role="status"
+          className={`no-print border-b px-4 py-2.5 text-center text-xs flex items-center justify-center gap-3 ${
+            authCallbackBanner.status === 'verified'
+              ? 'bg-[#F0F7F3] border-[#C6E2D1] text-[#245A3F]'
+              : 'bg-[#FDF2F2] border-[#F2C6C6] text-[#9B2C2C]'
+          }`}
+        >
+          <span>{authCallbackBanner.message}</span>
+          <button
+            type="button"
+            onClick={() => setAuthCallbackBanner(null)}
+            className="underline font-medium cursor-pointer"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 

@@ -89,6 +89,8 @@ export interface PaymentTransactionSummary {
 export interface PremiumStatusResponse {
   mode: 'test' | 'live';
   isPremium: boolean;
+  hasOneTimePurchase?: boolean;
+  hasMonthlySubscription?: boolean;
   plan: PremiumPlanId | null;
   transactionReference: string | null;
   amountPaid: number | null;
