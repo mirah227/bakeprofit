@@ -105,6 +105,34 @@ function mapTransactionRow(row: TransactionRow): PaymentTransactionRecord {
 
 // Per-reference mutex to serialize concurrent webhook and callback verification calls
 const referenceLocks = new Map<string, Promise<unknown>>();
+// Per-user+plan mutex to serialize concurrent checkout initiation requests
+const initiationLocks = new Map<string, Promise<unknown>>();
+
+export class DuplicatePendingCheckoutError extends Error {
+  constructor(message = 'A pending checkout already exists for this user and plan.') {
+    super(message);
+    this.name = 'DuplicatePendingCheckoutError';
+  }
+}
+
+export class SupabaseSchemaNotReadyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SupabaseSchemaNotReadyError';
+  }
+}
+
+function isSchemaMissingError(err: { code?: string; message?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const code = err.code || '';
+  const msg = err.message || '';
+  return (
+    code === 'PGRST205' ||
+    code === '42P01' ||
+    msg.includes('Could not find the table') ||
+    msg.includes('does not exist')
+  );
+}
 
 export function withTransactionLock<T>(
   reference: string,
@@ -116,6 +144,21 @@ export function withTransactionLock<T>(
   next.finally(() => {
     if (referenceLocks.get(reference) === next) {
       referenceLocks.delete(reference);
+    }
+  });
+  return next;
+}
+
+export function withInitiationLock<T>(
+  key: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const prev = initiationLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(task, task);
+  initiationLocks.set(key, next);
+  next.finally(() => {
+    if (initiationLocks.get(key) === next) {
+      initiationLocks.delete(key);
     }
   });
   return next;
@@ -139,8 +182,63 @@ export async function createPendingTransaction(
   });
 
   if (error) {
+    if (error.code === '23505') {
+      throw new DuplicatePendingCheckoutError();
+    }
     throw new Error(`Failed to record payment transaction in Supabase: ${error.message}`);
   }
+}
+
+export async function findPendingTransactionsForUserPlan(
+  userId: string,
+  plan: PremiumPlanId,
+  environment: NovacEnvironment
+): Promise<PaymentTransactionRecord[]> {
+  const admin = getSupabaseAdmin();
+  const { data, error } = await admin
+    .from('payment_transactions')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('plan', plan)
+    .eq('environment', environment)
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false })
+    .returns<TransactionRow[]>();
+
+  if (error) {
+    throw new Error(`Failed to check pending transactions in Supabase: ${error.message}`);
+  }
+
+  return (data ?? []).map(mapTransactionRow);
+}
+
+export async function updateReservedTransactionReference(
+  reservedReference: string,
+  actualReference: string
+): Promise<void> {
+  if (!actualReference || actualReference === reservedReference) return;
+  const admin = getSupabaseAdmin();
+  const { error } = await admin
+    .from('payment_transactions')
+    .update({
+      transaction_reference: actualReference,
+      requested_reference: reservedReference,
+    })
+    .eq('transaction_reference', reservedReference)
+    .eq('status', 'pending');
+
+  if (error) {
+    throw new Error(`Failed to update transaction reference in Supabase: ${error.message}`);
+  }
+}
+
+export async function deletePendingReservation(transactionReference: string): Promise<void> {
+  const admin = getSupabaseAdmin();
+  await admin
+    .from('payment_transactions')
+    .delete()
+    .eq('transaction_reference', transactionReference)
+    .eq('status', 'pending');
 }
 
 export async function findTransactionByReference(
@@ -273,12 +371,19 @@ export async function appendWebhookEvent(
 
 export async function markPendingTransactionStatus(
   transactionReference: string,
-  status: 'failed' | 'abandoned'
+  status: 'failed' | 'abandoned',
+  gatewayResponseMessage?: string
 ): Promise<void> {
   const admin = getSupabaseAdmin();
+  const payload: { status: 'failed' | 'abandoned'; gateway_response_message?: string } = {
+    status,
+  };
+  if (gatewayResponseMessage) {
+    payload.gateway_response_message = gatewayResponseMessage;
+  }
   await admin
     .from('payment_transactions')
-    .update({ status })
+    .update(payload)
     .eq('transaction_reference', transactionReference)
     .eq('status', 'pending');
 }
@@ -289,8 +394,8 @@ export async function getUserPremiumState(userId: string): Promise<{
 }> {
   const admin = getSupabaseAdmin();
 
-  const [{ data: subRow, error: subErr }, { data: txRows, error: txErr }] =
-    await Promise.all([
+  const queryUserState = () =>
+    Promise.all([
       admin
         .from('premium_subscriptions')
         .select('*')
@@ -305,10 +410,34 @@ export async function getUserPremiumState(userId: string): Promise<{
         .returns<TransactionRow[]>(),
     ]);
 
+  let [{ data: subRow, error: subErr }, { data: txRows, error: txErr }] =
+    await queryUserState();
+
+  // Retry with backoff in case PostgREST is mid schema-cache reload
+  const retryDelaysMs = [250, 500, 1000];
+  for (const delayMs of retryDelaysMs) {
+    if (!isSchemaMissingError(subErr) && !isSchemaMissingError(txErr)) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    [{ data: subRow, error: subErr }, { data: txRows, error: txErr }] =
+      await queryUserState();
+  }
+
   if (subErr) {
+    if (isSchemaMissingError(subErr)) {
+      throw new SupabaseSchemaNotReadyError(
+        `Supabase table public.premium_subscriptions is unavailable in schema cache (${subErr.message}). Run migrations 001 and 002 in Supabase SQL Editor.`
+      );
+    }
     throw new Error(`Failed to fetch premium subscription: ${subErr.message}`);
   }
   if (txErr) {
+    if (isSchemaMissingError(txErr)) {
+      throw new SupabaseSchemaNotReadyError(
+        `Supabase table public.payment_transactions is unavailable in schema cache (${txErr.message}). Run migrations 001 and 002 in Supabase SQL Editor.`
+      );
+    }
     throw new Error(`Failed to fetch payment transactions: ${txErr.message}`);
   }
 

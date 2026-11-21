@@ -154,8 +154,17 @@ export function PremiumView({
         plan: result.plan,
       });
 
-      // Redirect customer to Novac's hosted checkout
-      window.location.assign(result.paymentRedirectUrl);
+      let isEmbeddedIframe = false;
+      try {
+        isEmbeddedIframe = window.self !== window.top;
+      } catch {
+        isEmbeddedIframe = true;
+      }
+
+      if (!isEmbeddedIframe) {
+        // Redirect customer directly to Novac's hosted checkout in top-level windows
+        window.location.assign(result.paymentRedirectUrl);
+      }
     } catch (err) {
       setFormError(
         err instanceof Error ? err.message : 'Unable to start Novac checkout.'
@@ -698,15 +707,18 @@ export function PremiumView({
             ) : (
               <div className="mt-5 space-y-4">
                 <div className="rounded-2xl bg-[#FCF7F8] border border-[#F0D9DF] p-4 text-sm text-[#3B2A24]">
-                  <p className="font-medium">Redirecting you to Novac Checkout...</p>
-                  <p className="mt-1 text-xs text-[#6B544B] font-[family-name:var(--font-mono)]">
+                  <p className="font-medium">Your Novac checkout is ready</p>
+                  <p className="mt-1 text-xs text-[#6B544B]">
+                    Tap Proceed to Novac Checkout below to open the payment page in a new tab, then return here to verify.
+                  </p>
+                  <p className="mt-1.5 text-xs text-[#6B544B] font-[family-name:var(--font-mono)]">
                     Ref: {checkoutPendingInfo.reference}
                   </p>
                 </div>
 
                 <a
                   href={checkoutPendingInfo.redirectUrl}
-                  target="_top"
+                  target="_blank"
                   rel="noopener noreferrer"
                   className="w-full inline-flex items-center justify-center gap-2 py-3 px-4 text-sm font-semibold text-white bg-[#4A352E] hover:bg-[#3B2A24] rounded-xl transition-colors"
                 >

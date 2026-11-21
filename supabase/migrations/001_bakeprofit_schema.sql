@@ -167,7 +167,7 @@ ALTER TABLE public.recipe_ingredients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.payment_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.premium_subscriptions ENABLE ROW LEVEL SECURITY;
 
--- 10. Policies: Profiles (users can only access and update their own profile)
+-- 10. Policies: Profiles
 DROP POLICY IF EXISTS "Users can view own profile" ON public.profiles;
 CREATE POLICY "Users can view own profile"
   ON public.profiles FOR SELECT
@@ -187,7 +187,7 @@ CREATE POLICY "Users can update own profile"
   USING (auth.uid() = id)
   WITH CHECK (auth.uid() = id);
 
--- 11. Policies: Recipes (users can only access and modify their own recipes)
+-- 11. Policies: Recipes
 DROP POLICY IF EXISTS "Users can view own recipes" ON public.recipes;
 CREATE POLICY "Users can view own recipes"
   ON public.recipes FOR SELECT
@@ -213,7 +213,7 @@ CREATE POLICY "Users can delete own recipes"
   TO authenticated
   USING (auth.uid() = user_id);
 
--- 12. Policies: Recipe Ingredients (users can only access and modify ingredients for their own recipes)
+-- 12. Policies: Recipe Ingredients
 DROP POLICY IF EXISTS "Users can view own recipe ingredients" ON public.recipe_ingredients;
 CREATE POLICY "Users can view own recipe ingredients"
   ON public.recipe_ingredients FOR SELECT
@@ -270,7 +270,6 @@ CREATE POLICY "Users can delete own recipe ingredients"
   );
 
 -- 13. Policies: Payment Transactions & Premium Subscriptions
--- Users can ONLY read their own records. Inserts/Updates are restricted to server-side service role (SUPABASE_SECRET_KEY).
 DROP POLICY IF EXISTS "Users can view own payment transactions" ON public.payment_transactions;
 CREATE POLICY "Users can view own payment transactions"
   ON public.payment_transactions FOR SELECT

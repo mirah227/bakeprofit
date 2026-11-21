@@ -13,10 +13,16 @@ import {
 import {
   appendWebhookEvent,
   createPendingTransaction,
+  deletePendingReservation,
+  DuplicatePendingCheckoutError,
+  findPendingTransactionsForUserPlan,
   findTransactionByReference,
   getUserPremiumState,
   markPendingTransactionStatus,
+  SupabaseSchemaNotReadyError,
+  updateReservedTransactionReference,
   updateTransactionAndSubscription,
+  withInitiationLock,
   withTransactionLock,
 } from './server/paymentStore.ts';
 import type { PaymentTransactionRecord, TransactionStatus } from './server/paymentStore.ts';
@@ -26,7 +32,17 @@ import {
   getSupabaseEnv,
 } from './server/supabase.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+function resolvePort(): number {
+  const portFlagIndex = process.argv.indexOf('--port');
+  if (portFlagIndex !== -1 && process.argv[portFlagIndex + 1]) {
+    const parsed = Number(process.argv[portFlagIndex + 1]);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  if (process.env.PORT) return Number(process.env.PORT);
+  return 3000;
+}
+
+const PORT = resolvePort();
 
 function resolveAppOrigin(req: Request): string {
   const configured = process.env.APP_URL?.trim();
@@ -45,11 +61,146 @@ function resolveAppOrigin(req: Request): string {
 
 function normalizeClientIp(req: Request): string {
   const forwarded = req.headers['x-forwarded-for'];
-  const rawIp =
-    typeof forwarded === 'string' && forwarded.length > 0
-      ? forwarded.split(',')[0].trim()
-      : req.ip || req.socket.remoteAddress || '';
+  const forwardedFirst = Array.isArray(forwarded)
+    ? forwarded[0]
+    : typeof forwarded === 'string'
+      ? forwarded.split(',')[0]
+      : '';
+  const rawIp = (forwardedFirst || req.ip || req.socket.remoteAddress || '').trim();
   return rawIp.replace(/^::ffff:/, '').trim();
+}
+
+async function verifyAndFinalizeTransactionUnlocked(
+  existing: PaymentTransactionRecord,
+  source: 'callback' | 'webhook' | 'manual',
+  expectedUserId?: string
+): Promise<{
+  outcome: 'successful' | 'pending' | 'failed' | 'abandoned' | 'reversed' | 'not_found' | 'error';
+  message: string;
+  transaction?: PaymentTransactionRecord;
+}> {
+  if (expectedUserId && existing.userId !== expectedUserId) {
+    return {
+      outcome: 'error',
+      message: 'Transaction reference does not belong to the signed-in user.',
+    };
+  }
+
+  // Prevent duplicate processing once verified successful (unless webhook checks reversal)
+  if (existing.status === 'successful' && source !== 'webhook') {
+    return {
+      outcome: 'successful',
+      message: 'Payment already verified.',
+      transaction: existing,
+    };
+  }
+
+  const config = getNovacConfig();
+  if (!config.isConfigured) {
+    return {
+      outcome: 'error',
+      message: config.keyMismatchError || `Novac keys missing: ${config.missingKeys.join(', ')}`,
+    };
+  }
+
+  const verifyResponse = await verifyNovacTransaction(config, existing.transactionReference);
+  if (!verifyResponse.status || !verifyResponse.data) {
+    return {
+      outcome: 'error',
+      message: verifyResponse.message || 'Could not verify transaction with Novac.',
+    };
+  }
+
+  const data = verifyResponse.data;
+  const novacStatus = String(data.status || '').toLowerCase() as TransactionStatus;
+
+  if (
+    data.transactionReference &&
+    data.transactionReference !== existing.transactionReference
+  ) {
+    return {
+      outcome: 'error',
+      message: 'Transaction reference mismatch during Novac verification.',
+    };
+  }
+
+  const verifiedCurrency = String(data.currency || '').toUpperCase();
+  if (verifiedCurrency && verifiedCurrency !== existing.currency) {
+    return {
+      outcome: 'error',
+      message: `Currency mismatch: expected ${existing.currency}, got ${verifiedCurrency}.`,
+    };
+  }
+
+  const verifiedAmount = Number(data.amount);
+  if (!Number.isFinite(verifiedAmount) || verifiedAmount !== existing.expectedAmount) {
+    return {
+      outcome: 'error',
+      message: `Amount mismatch: expected ₦${existing.expectedAmount}, got ₦${data.amount ?? 'unknown'}.`,
+    };
+  }
+
+  const verifiedDomain = String(data.domain || '').toLowerCase();
+  if (verifiedDomain && verifiedDomain !== config.mode) {
+    return {
+      outcome: 'error',
+      message: `Environment mismatch: server is in ${config.mode} mode but Novac returned ${verifiedDomain}.`,
+    };
+  }
+
+  // Idempotency guard for concurrent webhook + callback
+  if (existing.status === 'successful' && novacStatus === 'successful') {
+    return {
+      outcome: 'successful',
+      message: 'Payment already verified.',
+      transaction: existing,
+    };
+  }
+
+  // Never downgrade an already verified successful transaction unless Novac confirms reversal
+  if (existing.status === 'successful' && novacStatus !== 'reversed') {
+    return {
+      outcome: 'successful',
+      message: 'Payment already verified.',
+      transaction: existing,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const mappedStatus: TransactionStatus =
+    novacStatus === 'successful' ||
+    novacStatus === 'failed' ||
+    novacStatus === 'abandoned' ||
+    novacStatus === 'reversed'
+      ? novacStatus
+      : 'pending';
+
+  const updated = await updateTransactionAndSubscription({
+    transactionReference: existing.transactionReference,
+    userId: existing.userId,
+    plan: existing.plan,
+    expectedAmount: existing.expectedAmount,
+    currency: existing.currency,
+    environment: existing.environment,
+    nextStatus: mappedStatus,
+    novacTransactionId: data.id ?? existing.novacTransactionId,
+    chargedAmount: data.chargedAmount ?? existing.chargedAmount,
+    channel: data.channel ?? existing.channel,
+    gatewayResponseCode: data.gatewayResponseCode ?? existing.gatewayResponseCode,
+    gatewayResponseMessage: data.gatewayResponseMessage ?? existing.gatewayResponseMessage,
+    verifiedAt: mappedStatus === 'successful' ? existing.verifiedAt || now : existing.verifiedAt,
+    verificationSource:
+      mappedStatus === 'successful' ? existing.verificationSource || source : existing.verificationSource,
+  });
+
+  return {
+    outcome: updated.status,
+    message:
+      updated.status === 'successful'
+        ? 'Payment verified successfully.'
+        : updated.gatewayResponseMessage || `Transaction status is ${updated.status}.`,
+    transaction: updated,
+  };
 }
 
 async function verifyAndFinalizeTransaction(
@@ -61,132 +212,23 @@ async function verifyAndFinalizeTransaction(
   message: string;
   transaction?: PaymentTransactionRecord;
 }> {
-  return withTransactionLock(reference, async () => {
-    const existing = await findTransactionByReference(reference);
+  const initial = await findTransactionByReference(reference);
+  if (!initial) {
+    return {
+      outcome: 'not_found',
+      message: 'Transaction reference was not found in database records.',
+    };
+  }
+
+  return withTransactionLock(initial.transactionReference, async () => {
+    const existing = await findTransactionByReference(initial.transactionReference);
     if (!existing) {
       return {
         outcome: 'not_found',
         message: 'Transaction reference was not found in database records.',
       };
     }
-
-    if (expectedUserId && existing.userId !== expectedUserId) {
-      return {
-        outcome: 'error',
-        message: 'Transaction reference does not belong to the signed-in user.',
-      };
-    }
-
-    // Prevent duplicate processing once verified successful (unless webhook checks reversal)
-    if (existing.status === 'successful' && source !== 'webhook') {
-      return {
-        outcome: 'successful',
-        message: 'Payment already verified.',
-        transaction: existing,
-      };
-    }
-
-    const config = getNovacConfig();
-    if (!config.isConfigured) {
-      return {
-        outcome: 'error',
-        message: config.keyMismatchError || `Novac keys missing: ${config.missingKeys.join(', ')}`,
-      };
-    }
-
-    const verifyResponse = await verifyNovacTransaction(config, existing.transactionReference);
-    if (!verifyResponse.status || !verifyResponse.data) {
-      return {
-        outcome: 'error',
-        message: verifyResponse.message || 'Could not verify transaction with Novac.',
-      };
-    }
-
-    const data = verifyResponse.data;
-    const novacStatus = String(data.status || '').toLowerCase() as TransactionStatus;
-
-    if (
-      data.transactionReference &&
-      data.transactionReference !== existing.transactionReference
-    ) {
-      return {
-        outcome: 'error',
-        message: 'Transaction reference mismatch during Novac verification.',
-      };
-    }
-
-    const verifiedCurrency = String(data.currency || '').toUpperCase();
-    if (verifiedCurrency && verifiedCurrency !== existing.currency) {
-      return {
-        outcome: 'error',
-        message: `Currency mismatch: expected ${existing.currency}, got ${verifiedCurrency}.`,
-      };
-    }
-
-    const verifiedAmount = Number(data.amount ?? 0);
-    if (
-      Number.isFinite(verifiedAmount) &&
-      verifiedAmount > 0 &&
-      verifiedAmount !== existing.expectedAmount
-    ) {
-      return {
-        outcome: 'error',
-        message: `Amount mismatch: expected ₦${existing.expectedAmount}, got ₦${verifiedAmount}.`,
-      };
-    }
-
-    const verifiedDomain = String(data.domain || '').toLowerCase();
-    if (verifiedDomain && verifiedDomain !== config.mode) {
-      return {
-        outcome: 'error',
-        message: `Environment mismatch: server is in ${config.mode} mode but Novac returned ${verifiedDomain}.`,
-      };
-    }
-
-    // Idempotency guard for concurrent webhook + callback
-    if (existing.status === 'successful' && novacStatus === 'successful') {
-      return {
-        outcome: 'successful',
-        message: 'Payment already verified.',
-        transaction: existing,
-      };
-    }
-
-    const now = new Date().toISOString();
-    const mappedStatus: TransactionStatus =
-      novacStatus === 'successful' ||
-      novacStatus === 'failed' ||
-      novacStatus === 'abandoned' ||
-      novacStatus === 'reversed'
-        ? novacStatus
-        : 'pending';
-
-    const updated = await updateTransactionAndSubscription({
-      transactionReference: existing.transactionReference,
-      userId: existing.userId,
-      plan: existing.plan,
-      expectedAmount: existing.expectedAmount,
-      currency: existing.currency,
-      environment: existing.environment,
-      nextStatus: mappedStatus,
-      novacTransactionId: data.id ?? existing.novacTransactionId,
-      chargedAmount: data.chargedAmount ?? existing.chargedAmount,
-      channel: data.channel ?? existing.channel,
-      gatewayResponseCode: data.gatewayResponseCode ?? existing.gatewayResponseCode,
-      gatewayResponseMessage: data.gatewayResponseMessage ?? existing.gatewayResponseMessage,
-      verifiedAt: mappedStatus === 'successful' ? existing.verifiedAt || now : existing.verifiedAt,
-      verificationSource:
-        mappedStatus === 'successful' ? existing.verificationSource || source : existing.verificationSource,
-    });
-
-    return {
-      outcome: updated.status,
-      message:
-        updated.status === 'successful'
-          ? 'Payment verified successfully.'
-          : updated.gatewayResponseMessage || `Transaction status is ${updated.status}.`,
-      transaction: updated,
-    };
+    return verifyAndFinalizeTransactionUnlocked(existing, source, expectedUserId);
   });
 }
 
@@ -194,6 +236,130 @@ async function startServer() {
   const app = express();
 
   app.set('trust proxy', true);
+
+  // Official Novac Webhook IP Whitelisting (runs before JSON body parsing)
+  const webhookIpWhitelist = (req: Request, res: Response, next: NextFunction) => {
+    const config = getNovacConfig();
+    const clientIp = normalizeClientIp(req);
+    if (config.allowedWebhookIps.includes(clientIp)) {
+      return next();
+    }
+    console.warn(`[Novac Test Webhook] Blocked unauthorized IP: ${clientIp}`);
+    return res.status(403).json({ error: 'Forbidden' });
+  };
+
+  // Dedicated Novac TEST Webhook Endpoint (POST only; live webhooks are intentionally not active)
+  app.post(
+    '/api/webhooks/novac/test',
+    webhookIpWhitelist,
+    express.json(),
+    async (req: Request, res: Response) => {
+      const config = getNovacConfig();
+      if (config.mode !== 'test') {
+        return res.status(403).json({
+          error: 'Novac test webhook endpoint is disabled outside test mode.',
+        });
+      }
+
+      if (!getSupabaseEnv().isServerConfigured) {
+        return res.status(503).json({ received: false, error: 'Database not configured' });
+      }
+
+      const payload = req.body as {
+        notify?: string;
+        notifyType?: string;
+        data?: {
+          id?: number | string;
+          domain?: string;
+          transactionReference?: string;
+          reference?: string;
+          status?: string;
+        };
+      };
+
+      const payloadDomain = String(payload?.data?.domain || '').trim().toLowerCase();
+      if (payloadDomain && payloadDomain !== 'test') {
+        console.warn(`[Novac Test Webhook] Ignored non-test domain event: ${payloadDomain}`);
+        return res.status(200).json({ received: true, ignored: 'live_webhooks_not_active' });
+      }
+
+      const reference = String(
+        payload?.data?.transactionReference || payload?.data?.reference || ''
+      ).trim();
+      const notify = String(payload?.notify || 'event').trim().toLowerCase();
+      const notifyType = String(payload?.notifyType || payload?.data?.status || '')
+        .trim()
+        .toLowerCase();
+
+      if (!reference) {
+        return res.status(200).json({ received: true, ignored: 'missing_reference' });
+      }
+
+      try {
+        const initialTx = await findTransactionByReference(reference);
+        if (!initialTx) {
+          return res.status(200).json({ received: true, ignored: 'unknown_reference' });
+        }
+
+        if (initialTx.environment !== 'test') {
+          return res.status(200).json({ received: true, ignored: 'non_test_transaction' });
+        }
+
+        const result = await withTransactionLock(initialTx.transactionReference, async () => {
+          const tx = await findTransactionByReference(initialTx.transactionReference);
+          if (!tx) {
+            return { statusCode: 200, body: { received: true, ignored: 'unknown_reference' } };
+          }
+
+          const dataIdPart =
+            payload?.data?.id !== undefined && payload?.data?.id !== null
+              ? String(payload.data.id)
+              : '';
+          const eventKey = dataIdPart ? `${notify}:${notifyType}:${dataIdPart}` : `${notify}:${notifyType}`;
+
+          const alreadyRecordedEvent = tx.webhookEvents.includes(eventKey);
+          const alreadySameStatus =
+            (notifyType === 'successful' && tx.status === 'successful') ||
+            (notifyType === 'reversed' && tx.status === 'reversed') ||
+            ((notifyType === 'failed' || notifyType === 'abandoned') && tx.status === notifyType);
+
+          if (alreadyRecordedEvent || alreadySameStatus) {
+            return {
+              statusCode: 200,
+              body: { received: true, duplicate: true, status: tx.status },
+            };
+          }
+
+          // Always verify directly with Novac's Verify Transaction API before granting/updating access
+          const verification = await verifyAndFinalizeTransactionUnlocked(tx, 'webhook');
+          if (verification.outcome === 'error') {
+            return {
+              statusCode: 500,
+              body: { received: false, error: verification.message },
+            };
+          }
+
+          await appendWebhookEvent(tx.transactionReference, eventKey);
+
+          return {
+            statusCode: 200,
+            body: { received: true, status: verification.outcome },
+          };
+        });
+
+        return res.status(result.statusCode).json(result.body);
+      } catch (err) {
+        console.error('[Novac Test Webhook] Processing error:', err);
+        return res.status(500).json({ received: false });
+      }
+    }
+  );
+
+  app.all('/api/webhooks/novac/test', (_req: Request, res: Response) => {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'Method Not Allowed. Novac webhooks must use POST.' });
+  });
+
   app.use(express.json());
 
   // Public Supabase client configuration (exposes ONLY url and publishableKey; NEVER secretKey)
@@ -282,6 +448,14 @@ async function startServer() {
         })),
       });
     } catch (err) {
+      if (err instanceof SupabaseSchemaNotReadyError) {
+        return res.status(503).json({
+          error: err.message,
+          mode: getNovacConfig().mode,
+          isPremium: false,
+          recentTransactions: [],
+        });
+      }
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Unable to fetch premium status from Supabase.',
       });
@@ -289,6 +463,8 @@ async function startServer() {
   });
 
   // Initiate Novac checkout for authenticated Supabase user
+  const PENDING_CHECKOUT_TTL_MS = 15 * 60 * 1000;
+
   app.post('/api/payments/initiate', async (req: Request, res: Response) => {
     try {
       const supabaseEnv = getSupabaseEnv();
@@ -339,52 +515,167 @@ async function startServer() {
         return res.status(400).json({ error: 'Please enter your first and last name.' });
       }
 
-      const generatedRef = generateTransactionReference();
-      const origin = resolveAppOrigin(req);
-      const redirectUrl = `${origin}/payment/callback`;
+      const initiationResult = await withInitiationLock(
+        `${user.id}:${plan.id}:${config.mode}`,
+        async () => {
+          // 1. Server-side premium entitlement check (never rely on frontend button state alone)
+          const { account } = await getUserPremiumState(user.id);
+          if (account.isPremium) {
+            return {
+              statusCode: 409,
+              body: {
+                error: 'Your BakeProfit account already has active Premium access.',
+                code: 'ALREADY_PREMIUM',
+                transactionReference: account.transactionReference ?? null,
+              },
+            };
+          }
 
-      const novacResult = await initiateNovacCheckout({
-        config,
-        transactionReference: generatedRef,
-        amount: plan.amount,
-        currency: plan.currency,
-        redirectUrl,
-        customer: {
-          email,
-          firstName,
-          lastName,
-          phoneNumber,
-        },
-        plan: plan.id,
-        accountId: user.id,
-      });
+          // 2. Database-backed check for existing pending checkouts for the same user, plan & mode
+          const pendingList = await findPendingTransactionsForUserPlan(
+            user.id,
+            plan.id,
+            config.mode
+          );
 
-      const now = new Date().toISOString();
-      await createPendingTransaction({
-        transactionReference: novacResult.transactionReference,
-        requestedReference:
-          novacResult.transactionReference !== generatedRef ? generatedRef : null,
-        userId: user.id,
-        plan: plan.id,
-        expectedAmount: plan.amount,
-        currency: plan.currency,
-        environment: config.mode,
-        status: 'pending',
-        customerEmail: email,
-        createdAt: now,
-        updatedAt: now,
-        webhookEvents: [],
-      });
+          for (const pendingTx of pendingList) {
+            let outcome: string = 'pending';
+            try {
+              const verified = await verifyAndFinalizeTransaction(
+                pendingTx.transactionReference,
+                'manual',
+                user.id
+              );
+              outcome = verified.outcome;
+            } catch {
+              outcome = 'error';
+            }
 
-      return res.json({
-        transactionReference: novacResult.transactionReference,
-        paymentRedirectUrl: novacResult.paymentRedirectUrl,
-        amount: plan.amount,
-        currency: plan.currency,
-        plan: plan.id,
-        environment: config.mode,
-      });
+            if (outcome === 'successful') {
+              return {
+                statusCode: 409,
+                body: {
+                  error: 'Your payment has already been verified and Premium is now active.',
+                  code: 'ALREADY_PREMIUM',
+                  transactionReference: pendingTx.transactionReference,
+                },
+              };
+            }
+
+            const alreadyClosed =
+              outcome === 'failed' || outcome === 'abandoned' || outcome === 'reversed';
+            if (alreadyClosed) {
+              continue;
+            }
+
+            const createdMs = Date.parse(pendingTx.createdAt);
+            const ageMs = Number.isFinite(createdMs) ? Date.now() - createdMs : 0;
+
+            if (ageMs < PENDING_CHECKOUT_TTL_MS || outcome === 'error') {
+              return {
+                statusCode: 409,
+                body: {
+                  error:
+                    'A checkout for this plan is already in progress. Please complete or verify your pending payment before starting another.',
+                  code: 'PENDING_CHECKOUT_EXISTS',
+                  transactionReference: pendingTx.transactionReference,
+                },
+              };
+            }
+
+            // Stale unpaid checkout (>15 min) confirmed not paid on Novac: retire before creating a new one
+            await markPendingTransactionStatus(
+              pendingTx.transactionReference,
+              'abandoned',
+              'Superseded after checkout timeout'
+            );
+          }
+
+          // 3. Reserve a pending transaction row in Supabase BEFORE calling Novac
+          const generatedRef = generateTransactionReference();
+          const now = new Date().toISOString();
+
+          try {
+            await createPendingTransaction({
+              transactionReference: generatedRef,
+              requestedReference: null,
+              userId: user.id,
+              plan: plan.id,
+              expectedAmount: plan.amount,
+              currency: plan.currency,
+              environment: config.mode,
+              status: 'pending',
+              customerEmail: email,
+              createdAt: now,
+              updatedAt: now,
+              webhookEvents: [],
+            });
+          } catch (reserveErr) {
+            if (reserveErr instanceof DuplicatePendingCheckoutError) {
+              return {
+                statusCode: 409,
+                body: {
+                  error:
+                    'A checkout for this plan is already in progress. Please wait a moment or verify your pending payment.',
+                  code: 'PENDING_CHECKOUT_EXISTS',
+                },
+              };
+            }
+            throw reserveErr;
+          }
+
+          const origin = resolveAppOrigin(req);
+          const redirectUrl = `${origin}/payment/callback`;
+
+          try {
+            const novacResult = await initiateNovacCheckout({
+              config,
+              transactionReference: generatedRef,
+              amount: plan.amount,
+              currency: plan.currency,
+              redirectUrl,
+              customer: {
+                email,
+                firstName,
+                lastName,
+                phoneNumber,
+              },
+              plan: plan.id,
+              accountId: user.id,
+            });
+
+            if (novacResult.transactionReference !== generatedRef) {
+              await updateReservedTransactionReference(
+                generatedRef,
+                novacResult.transactionReference
+              );
+            }
+
+            return {
+              statusCode: 200,
+              body: {
+                transactionReference: novacResult.transactionReference,
+                paymentRedirectUrl: novacResult.paymentRedirectUrl,
+                amount: plan.amount,
+                currency: plan.currency,
+                plan: plan.id,
+                environment: config.mode,
+              },
+            };
+          } catch (novacErr) {
+            await deletePendingReservation(generatedRef);
+            throw novacErr;
+          }
+        }
+      );
+
+      return res.status(initiationResult.statusCode).json(initiationResult.body);
     } catch (err) {
+      if (err instanceof SupabaseSchemaNotReadyError) {
+        return res.status(503).json({
+          error: err.message,
+        });
+      }
       return res.status(400).json({
         error: err instanceof Error ? err.message : 'Unable to initiate Novac checkout.',
       });
@@ -475,70 +766,29 @@ async function startServer() {
     }
   });
 
-  // Official Novac Webhook Receiver with IP Whitelisting + Server-Side Verification + Supabase persistence
-  const webhookIpWhitelist = (req: Request, res: Response, next: NextFunction) => {
-    const config = getNovacConfig();
-    const clientIp = normalizeClientIp(req);
-    if (config.allowedWebhookIps.includes(clientIp)) {
-      return next();
-    }
-    console.warn(`[Novac Webhook] Blocked unauthorized IP: ${clientIp}`);
-    return res.status(403).json({ error: 'Forbidden' });
-  };
-
-  app.post('/api/webhooks/novac', webhookIpWhitelist, async (req: Request, res: Response) => {
-    const payload = req.body as {
-      notify?: string;
-      notifyType?: string;
-      data?: {
-        transactionReference?: string;
-        reference?: string;
-        status?: string;
-      };
-    };
-
-    const reference = String(
-      payload?.data?.transactionReference || payload?.data?.reference || ''
-    ).trim();
-    const notifyType = String(payload?.notifyType || payload?.data?.status || '').toLowerCase();
-
-    if (!reference) {
-      return res.status(200).json({ received: true, ignored: 'missing_reference' });
-    }
-
-    try {
-      const tx = await findTransactionByReference(reference);
-      if (!tx) {
-        return res.status(200).json({ received: true, ignored: 'unknown_reference' });
-      }
-
-      const eventKey = `${payload?.notify || 'event'}:${notifyType}`;
-      await appendWebhookEvent(tx.transactionReference, eventKey);
-
-      if (notifyType === 'successful' || notifyType === 'reversed') {
-        await verifyAndFinalizeTransaction(tx.transactionReference, 'webhook');
-      } else if (notifyType === 'failed' || notifyType === 'abandoned') {
-        await markPendingTransactionStatus(
-          tx.transactionReference,
-          notifyType as 'failed' | 'abandoned'
-        );
-      }
-
-      return res.status(200).json({ received: true });
-    } catch (err) {
-      console.error('[Novac Webhook] Processing error:', err);
-      return res.status(500).json({ received: false });
-    }
-  });
+  // Live payment webhooks are intentionally not created or activated yet.
 
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= 'true';
+    const vitePromise = (async () => {
+      const { createServer: createViteServer } = await import('vite');
+      return createViteServer({
+        server: { middlewareMode: true, hmr: false, ws: false, allowedHosts: true },
+        appType: 'spa',
+      });
+    })();
+
+    vitePromise.catch((err) => {
+      console.error('Failed to initialize Vite dev middleware:', err);
+      process.exit(1);
     });
-    app.use(vite.middlewares);
+
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      vitePromise
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(next);
+    });
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));

@@ -135,7 +135,6 @@ export function AuthModal({
           </p>
         )}
 
-        {/* Mode Segmented Switch */}
         <div className="mt-4 grid grid-cols-2 gap-1 p-1 rounded-xl bg-[#F7F1EB]">
           <button
             type="button"
